@@ -1,0 +1,861 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gorilla Tag Fangame – WebXR</title>
+
+<!-- Tailwind por CDN (solo para el menú 2D de escritorio) -->
+<script src="https://cdn.tailwindcss.com"></script>
+
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b1020;
+               font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #app { position: fixed; inset: 0; }
+  #app canvas { display: block; }
+</style>
+
+<!-- Import map: Three.js + cannon-es (motor de físicas ligero) desde CDN -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"
+  }
+}
+</script>
+</head>
+
+<body>
+<!-- Contenedor del canvas WebGL -->
+<div id="app"></div>
+
+<!-- HUD de escritorio (vista previa) -->
+<div id="desktop-hud"
+     class="fixed top-3 left-3 z-10 rounded-full bg-slate-900/70 backdrop-blur px-4 py-1.5 text-xs text-slate-200 font-mono select-none">
+  Vista previa · <span id="dh-fps">--</span> FPS · <span id="dh-speed">0.0</span> m/s
+</div>
+
+<!-- Botón para reabrir el menú -->
+<button id="show-menu"
+        class="hidden fixed bottom-4 right-4 z-20 rounded-full bg-slate-900/80 hover:bg-slate-800 text-white text-sm px-4 py-2 backdrop-blur">
+  ☰ Menú
+</button>
+
+<!-- Menú 2D flotante -->
+<div id="menu" class="fixed inset-0 z-20 flex items-center justify-center p-4 pointer-events-none">
+  <div class="pointer-events-auto w-full max-w-xl rounded-3xl bg-slate-900/80 backdrop-blur-md border border-white/10 shadow-2xl p-7 text-white">
+    <div class="flex items-center gap-3">
+      <div class="text-4xl">🦍</div>
+      <div>
+        <h1 class="text-2xl font-extrabold tracking-tight">Gorilla Tag <span class="text-orange-400">Fangame</span></h1>
+        <p class="text-slate-300 text-sm">Locomoción con los brazos · WebXR para Meta Quest</p>
+      </div>
+    </div>
+
+    <ul class="mt-5 space-y-2.5 text-sm text-slate-200">
+      <li class="flex gap-3"><span class="text-orange-400 font-bold">1</span>
+        <span><b>Sin joysticks ni botones.</b> Solo te mueves con tus manos.</span></li>
+      <li class="flex gap-3"><span class="text-orange-400 font-bold">2</span>
+        <span>Toca el suelo, una pared, un pilar o un árbol con las manos y <b>empuja</b> contra la superficie: tu cuerpo sale en sentido contrario.</span></li>
+      <li class="flex gap-3"><span class="text-orange-400 font-bold">3</span>
+        <span>Balancea los brazos <b>hacia abajo y atrás</b> como un gorila: cuanto más rápido golpeas, más fuerte sales. Arrastrar la mano por una pared mientras empujas te ayuda a trepar.</span></li>
+      <li class="flex gap-3"><span class="text-orange-400 font-bold">4</span>
+        <span>Usa rampas, plataformas, repisas de las paredes y la espiral central para subir. Las <b class="text-lime-400">almohadillas verdes</b> te hacen rebotar.</span></li>
+    </ul>
+
+    <button id="vr-btn" disabled
+            class="mt-6 w-full rounded-2xl bg-gradient-to-r from-orange-500 to-pink-500 hover:from-orange-400 hover:to-pink-400 disabled:opacity-40 disabled:cursor-not-allowed transition px-6 py-3.5 text-lg font-bold shadow-lg">
+      Comprobando WebXR…
+    </button>
+    <p id="vr-msg" class="mt-3 text-xs text-slate-400 min-h-[1.25rem]"></p>
+
+    <div class="mt-4 flex items-center justify-between text-xs text-slate-400">
+      <span>WebXR requiere <b>https</b> o <b>localhost</b>.</span>
+      <button id="hide-menu" class="underline hover:text-white">Ver arena (vista previa)</button>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import * as CANNON from 'cannon-es';
+
+/* =====================================================================
+ *  CONFIGURACIÓN AJUSTABLE
+ * ===================================================================== */
+const CFG = {
+  HAND_RADIUS: 0.065,        // radio físico de cada mano (m)
+  BODY_RADIUS: 0.18,         // radio de la esfera de colisión inferior del cuerpo (m)
+  HEAD_RADIUS: 0.16,         // radio de la esfera de colisión de la cabeza (m)
+  BODY_DROP: 0.62,           // distancia vertical cabeza → centro de la esfera inferior (m)
+  GRAVITY: 9.81,             // m/s²
+  AIR_DRAG: 0.12,            // amortiguación horizontal en el aire (1/s)
+  MAX_SPEED: 12,             // velocidad máxima al impulsarse (m/s)
+  LAUNCH_BOOST: 0.8,         // ganancia del empuje de las manos (súbela para saltar más)
+  ARM_SCALE: 1.8,            // ALCANCE DE BRAZOS: 1 = normal, 1.8 = brazos largos de gorila
+  HAND_FRICTION: 0.6,        // 0..1: cuánto te mueve arrastrar la mano mientras empujas
+  PUSH_EPS: 0.002,           // empuje mínimo por frame para contar (m)
+  MAX_PUSH: 0.25,            // empuje máximo por frame (evita saltos por fallos de tracking)
+  CHEST_OFFSET: 0.34,        // altura del torso visible bajo la cabeza (m)
+  CHEST_RADIUS: 0.13,        // radio del torso visible (m)
+  BOUNCE_SPEED: 9.0,         // velocidad vertical mínima en las almohadillas de rebote (m/s)
+  SPAWN: new THREE.Vector3(0, 1.0, 9),
+  FALL_LIMIT: -15,           // por debajo de esta altura se reaparece
+  ARENA_HALF: 22             // semitamaño de la arena (m)
+};
+
+/* =====================================================================
+ *  UI (DOM)
+ * ===================================================================== */
+const $ = (id) => document.getElementById(id);
+const ui = {
+  menu: $('menu'), showMenu: $('show-menu'), hideMenu: $('hide-menu'),
+  vrBtn: $('vr-btn'), vrMsg: $('vr-msg'),
+  dhud: $('desktop-hud'), dhFps: $('dh-fps'), dhSpeed: $('dh-speed')
+};
+ui.hideMenu.onclick = () => { ui.menu.classList.add('hidden'); ui.showMenu.classList.remove('hidden'); };
+ui.showMenu.onclick = () => { ui.menu.classList.remove('hidden'); ui.showMenu.classList.add('hidden'); };
+
+/* =====================================================================
+ *  RENDERER / ESCENA / CÁMARAS (con "rig" para mover al jugador)
+ * ===================================================================== */
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.xr.enabled = true;                        // ← soporte WebXR
+renderer.xr.setReferenceSpaceType('local-floor');  // origen = suelo real
+renderer.xr.setFoveation(1);                       // ahorra GPU en Quest
+$('app').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb);
+scene.fog = new THREE.Fog(0x87ceeb, 35, 110);
+
+// El "rig" es el origen del espacio XR: moverlo = mover al jugador.
+const rig = new THREE.Group();
+scene.add(rig);
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.05, 200);
+rig.add(camera);
+
+// Cámara orbital solo para la vista previa de escritorio
+const previewCamera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 300);
+
+// Iluminación barata (sin sombras, pensada para Quest)
+scene.add(new THREE.HemisphereLight(0xcfe8ff, 0x55703a, 1.15));
+const sun = new THREE.DirectionalLight(0xffffff, 1.1);
+sun.position.set(12, 30, 8);
+scene.add(sun);
+
+window.addEventListener('resize', () => {
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  camera.aspect = previewCamera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  previewCamera.updateProjectionMatrix();
+});
+
+/* =====================================================================
+ *  MUNDO DE FÍSICAS (cannon-es)
+ *  La gravedad se aplica manualmente para poder anularla durante el anclaje.
+ * ===================================================================== */
+const world = new CANNON.World({ gravity: new CANNON.Vec3(0, 0, 0) });
+world.allowSleep = false;
+world.solver.iterations = 12;
+world.defaultContactMaterial.contactEquationStiffness = 1e8;
+world.defaultContactMaterial.contactEquationRelaxation = 3;
+
+const matGround = new CANNON.Material('ground');
+const matBounce = new CANNON.Material('bounce');
+const matPlayer = new CANNON.Material('player');
+world.addContactMaterial(new CANNON.ContactMaterial(matPlayer, matGround, {
+  friction: 0.2, restitution: 0.25, contactEquationStiffness: 1e8, contactEquationRelaxation: 3
+}));
+world.addContactMaterial(new CANNON.ContactMaterial(matPlayer, matBounce, {
+  friction: 0.05, restitution: 0.4, contactEquationStiffness: 1e8, contactEquationRelaxation: 3
+}));
+
+// Cuerpo físico del jugador: esfera dinámica (sin rotación)
+const playerBody = new CANNON.Body({
+  mass: 1, material: matPlayer, linearDamping: 0, fixedRotation: true,
+  shape: new CANNON.Sphere(CFG.BODY_RADIUS)
+});
+playerBody.addShape(new CANNON.Sphere(CFG.HEAD_RADIUS), new CANNON.Vec3(0, CFG.BODY_DROP, 0)); // cabeza
+playerBody.updateMassProperties();
+world.addBody(playerBody);
+
+// Rebote en almohadillas: el evento 'collide' nos avisa del contacto
+let bounceRequest = false;
+playerBody.addEventListener('collide', (e) => {
+  const o = e.body;
+  if (o && o.userData && o.userData.bouncy &&
+      playerBody.position.y - CFG.BODY_RADIUS > o.userData.topY - 0.25) {
+    bounceRequest = true;
+  }
+});
+
+/* =====================================================================
+ *  CONSTRUCCIÓN DEL NIVEL
+ *  Cada pieza crea a la vez: malla Three.js + cuerpo estático Cannon +
+ *  colisionador propio para las manos (esfera vs caja/esfera).
+ * ===================================================================== */
+const handColliders = [];
+const matCache = new Map();
+const Y_AXIS = new THREE.Vector3(0, 1, 0);
+const Z_AXIS = new THREE.Vector3(0, 0, 1);
+const V = (x, y, z) => new THREE.Vector3(x, y, z);
+
+function lambert(color, emissive = 0x000000) {
+  const key = color + '_' + emissive;
+  if (!matCache.has(key)) matCache.set(key, new THREE.MeshLambertMaterial({ color, emissive }));
+  return matCache.get(key);
+}
+function rainbow(i, n) { return new THREE.Color().setHSL(i / n, 0.72, 0.55).getHex(); }
+
+function canvasTexture(draw, size, repeatX, repeatY) {
+  const c = document.createElement('canvas'); c.width = c.height = size;
+  draw(c.getContext('2d'), size);
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(repeatX, repeatY);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 4;
+  return t;
+}
+
+function addBox({ pos, size, color = 0xffffff, quat = new THREE.Quaternion(), visible = true,
+                  material = null, bouncy = false, emissive = 0x000000 }) {
+  const [sx, sy, sz] = size;
+  if (visible) {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(sx, sy, sz), material || lambert(color, emissive));
+    mesh.position.copy(pos);
+    mesh.quaternion.copy(quat);
+    scene.add(mesh);
+  }
+  // Física (Cannon): cuerpo estático
+  const body = new CANNON.Body({ mass: 0, material: bouncy ? matBounce : matGround });
+  body.addShape(new CANNON.Box(new CANNON.Vec3(sx / 2, sy / 2, sz / 2)));
+  body.position.set(pos.x, pos.y, pos.z);
+  body.quaternion.set(quat.x, quat.y, quat.z, quat.w);
+  if (bouncy) body.userData = { bouncy: true, topY: pos.y + sy / 2 };
+  world.addBody(body);
+  // Colisionador para las manos
+  handColliders.push({
+    type: 'box', pos: pos.clone(), quat: quat.clone(), invQuat: quat.clone().invert(),
+    half: V(sx / 2, sy / 2, sz / 2), bound: Math.hypot(sx, sy, sz) / 2
+  });
+}
+
+function addSphere({ pos, r, color }) {
+  const mesh = new THREE.Mesh(new THREE.IcosahedronGeometry(r, 1), lambert(color));
+  mesh.position.copy(pos);
+  scene.add(mesh);
+  const body = new CANNON.Body({ mass: 0, material: matGround });
+  body.addShape(new CANNON.Sphere(r));
+  body.position.set(pos.x, pos.y, pos.z);
+  world.addBody(body);
+  handColliders.push({ type: 'sphere', pos: pos.clone(), r, bound: r });
+}
+
+// Rampa que sube en la dirección local +X (girada por "yaw"), arrancando en (x, 0, z)
+function addRamp({ x, z, yaw, length, width, rise, color }) {
+  const theta = Math.asin(rise / length);
+  const t = 0.5; // grosor
+  const qYaw = new THREE.Quaternion().setFromAxisAngle(Y_AXIS, yaw);
+  const qTilt = new THREE.Quaternion().setFromAxisAngle(Z_AXIS, theta);
+  const q = qYaw.clone().multiply(qTilt);
+  const local = V(
+    (length / 2) * Math.cos(theta) + (t / 2) * Math.sin(theta),
+    (length / 2) * Math.sin(theta) - (t / 2) * Math.cos(theta),
+    0
+  ).applyQuaternion(qYaw);
+  addBox({ pos: V(x + local.x, local.y, z + local.z), size: [length, t, width], quat: q, color });
+}
+
+function buildArena() {
+  const H = CFG.ARENA_HALF;
+
+  // ---- Suelo (cuadros verdes) ----
+  const floorTex = canvasTexture((g, s) => {
+    g.fillStyle = '#4caf50'; g.fillRect(0, 0, s, s);
+    g.fillStyle = '#3f9e44'; g.fillRect(0, 0, s / 2, s / 2); g.fillRect(s / 2, s / 2, s / 2, s / 2);
+  }, 128, 26, 26);
+  addBox({ pos: V(0, -1, 0), size: [2 * H + 8, 2, 2 * H + 8],
+           material: new THREE.MeshLambertMaterial({ map: floorTex }) });
+
+  // ---- Paredes (con franjas para percibir la velocidad) ----
+  const wallTex = canvasTexture((g, s) => {
+    g.fillStyle = '#5b4bd6'; g.fillRect(0, 0, s, s);
+    g.fillStyle = '#7a6af0'; g.fillRect(0, 0, s, s / 4);
+    g.fillStyle = '#4a3bb8'; g.fillRect(0, s / 2, s, s / 4);
+  }, 128, 8, 3);
+  const wallMat = new THREE.MeshLambertMaterial({ map: wallTex });
+  const wl = 2 * H + 3, wt = 1.5, wh = 16;
+  const walls = [
+    [0, -(H + wt / 2), wl, wt], [0, (H + wt / 2), wl, wt],
+    [-(H + wt / 2), 0, wt, wl], [(H + wt / 2), 0, wt, wl]
+  ];
+  for (const [x, z, sx, sz] of walls) {
+    addBox({ pos: V(x, wh / 2, z), size: [sx, wh, sz], material: wallMat });
+    // Extensión invisible hasta arriba (solo colisión)
+    addBox({ pos: V(x, wh + 7, z), size: [sx, 14, sz], visible: false });
+  }
+  // Techo invisible
+  addBox({ pos: V(0, 30.5, 0), size: [2 * H + 8, 1, 2 * H + 8], visible: false });
+
+  // ---- Torre central ----
+  addBox({ pos: V(0, 2.25, 0), size: [3, 4.5, 3], color: 0xffc107 });
+
+  // ---- Anillo de 8 pilares de alturas distintas ----
+  const pillarH = [2.5, 3.5, 4.5, 3.0, 5.5, 3.5, 4.0, 2.0];
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2;
+    addBox({ pos: V(10 * Math.cos(a), pillarH[i] / 2, 10 * Math.sin(a)),
+             size: [1.4, pillarH[i], 1.4], color: rainbow(i, 8) });
+  }
+
+  // ---- Espiral de plataformas flotantes alrededor de la torre ----
+  const tops = [2.2, 3.8, 5.4, 7.0, 8.6, 10.2];
+  for (let i = 0; i < tops.length; i++) {
+    const a = i * 0.95 + 0.4;
+    addBox({ pos: V(6 * Math.cos(a), tops[i] - 0.3, 6 * Math.sin(a)),
+             size: [2.6, 0.6, 2.6], color: rainbow(i + 2, 9) });
+  }
+
+  // ---- Plataformas de esquina con rampa ----
+  const rise = 3, rampLen = 8;
+  const Lh = rampLen * Math.cos(Math.asin(rise / rampLen));
+  let idx = 0;
+  for (const sx of [-1, 1]) {
+    for (const sz of [-1, 1]) {
+      addBox({ pos: V(sx * 15, rise / 2, sz * 15), size: [6, rise, 6], color: rainbow(idx + 4, 8) });
+      addRamp({ x: sx * (12 - Lh), z: sz * 15, yaw: sx > 0 ? 0 : Math.PI,
+                length: rampLen, width: 4, rise, color: 0xff7043 });
+      idx++;
+    }
+  }
+
+  // ---- Repisas en las paredes (para escalar en vertical) ----
+  const ledgeH = [3.5, 6.0, 8.5, 11.0];
+  const ledgeOff = [-10, -3, 4, 11];
+  for (let i = 0; i < 4; i++) {
+    const o = ledgeOff[i], y = ledgeH[i];
+    const c = rainbow(i, 4);
+    addBox({ pos: V(o, y, -(H - 0.7)), size: [3.5, 0.5, 1.4], color: c });  // norte
+    addBox({ pos: V(-o, y, (H - 0.7)), size: [3.5, 0.5, 1.4], color: c });  // sur
+    addBox({ pos: V(-(H - 0.7), y, -o), size: [1.4, 0.5, 3.5], color: c }); // oeste
+    addBox({ pos: V((H - 0.7), y, o), size: [1.4, 0.5, 3.5], color: c });   // este
+  }
+
+  // ---- Árboles estilizados (tronco = caja, copa = esfera agarrable) ----
+  const trees = [[-19, 0, 5], [19, 0, 6], [0, -18, 4.5], [0, 18, 5.5],
+                 [-17, -6, 4], [17, 6, 4.5], [-17, 7, 5], [17, -7, 5.5]];
+  for (const [x, z, h] of trees) {
+    addBox({ pos: V(x, h / 2, z), size: [0.7, h, 0.7], color: 0x8d5a2b });
+    addSphere({ pos: V(x, h + 1.2, z), r: 2.2, color: 0x2e9e4f });
+  }
+
+  // ---- Almohadillas de rebote ----
+  for (const [x, z] of [[6, 5], [-6, -5], [0, 14]]) {
+    addBox({ pos: V(x, 0.25, z), size: [3, 0.5, 3], color: 0x39ff14, emissive: 0x1a8a0a, bouncy: true });
+  }
+}
+buildArena();
+
+/* =====================================================================
+ *  COLISIÓN DE MANOS: esfera contra cajas orientadas y esferas
+ * ===================================================================== */
+const _d = new THREE.Vector3(), _l = new THREE.Vector3(), _n = new THREE.Vector3();
+const contact = { touch: false, normal: new THREE.Vector3() };
+
+function sphereVsCollider(c, p, r, margin) {
+  _d.subVectors(p, c.pos);
+  const reach = c.bound + r + margin;
+  if (_d.lengthSq() > reach * reach) return;       // descarte rápido
+  let pen;
+  if (c.type === 'sphere') {
+    const dist = _d.length();
+    pen = c.r + r - dist;
+    if (pen <= -margin) return;
+    if (dist > 1e-6) _n.copy(_d).divideScalar(dist); else _n.set(0, 1, 0);
+  } else {
+    _l.copy(_d).applyQuaternion(c.invQuat);         // a espacio local de la caja
+    const hx = c.half.x, hy = c.half.y, hz = c.half.z;
+    const cx = Math.max(-hx, Math.min(hx, _l.x));
+    const cy = Math.max(-hy, Math.min(hy, _l.y));
+    const cz = Math.max(-hz, Math.min(hz, _l.z));
+    const dx = _l.x - cx, dy = _l.y - cy, dz = _l.z - cz;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (dist > 1e-6) {
+      pen = r - dist;
+      if (pen <= -margin) return;
+      _n.set(dx / dist, dy / dist, dz / dist);
+    } else {                                        // centro dentro de la caja
+      const px = hx - Math.abs(_l.x), py = hy - Math.abs(_l.y), pz = hz - Math.abs(_l.z);
+      if (px <= py && px <= pz) { _n.set(Math.sign(_l.x) || 1, 0, 0); pen = r + px; }
+      else if (py <= pz)        { _n.set(0, Math.sign(_l.y) || 1, 0); pen = r + py; }
+      else                      { _n.set(0, 0, Math.sign(_l.z) || 1); pen = r + pz; }
+    }
+    _n.applyQuaternion(c.quat);                     // normal de vuelta a mundo
+  }
+  contact.touch = true;
+  contact.normal.add(_n);
+  if (pen > 0) p.addScaledVector(_n, pen);          // expulsa la mano de la superficie
+}
+
+// Empuja el punto p fuera de toda geometría; devuelve si está tocando algo
+function resolveHand(p) {
+  contact.touch = false;
+  contact.normal.set(0, 0, 0);
+  for (let pass = 0; pass < 2; pass++) {
+    const margin = pass === 0 ? 0.02 : 0;           // margen de "toque" de 2 cm
+    for (const c of handColliders) sphereVsCollider(c, p, CFG.HAND_RADIUS, margin);
+  }
+  return contact;
+}
+
+/* =====================================================================
+ *  CUERPO VISIBLE DEL JUGADOR + MANOS
+ * ===================================================================== */
+const bodyMesh = new THREE.Mesh(new THREE.SphereGeometry(CFG.CHEST_RADIUS, 20, 14), lambert(0x3a3a46));
+bodyMesh.scale.set(1, 1.3, 0.85);
+scene.add(bodyMesh);
+
+// Cabeza (solo visible en la vista previa de escritorio)
+const headMesh = new THREE.Group();
+headMesh.add(new THREE.Mesh(new THREE.SphereGeometry(0.16, 20, 14), lambert(0x4b4b5a)));
+for (const sx of [-1, 1]) {
+  const eye = new THREE.Mesh(new THREE.SphereGeometry(0.035, 10, 8), new THREE.MeshBasicMaterial({ color: 0xffffff }));
+  eye.position.set(sx * 0.06, 0.03, -0.13);
+  headMesh.add(eye);
+}
+scene.add(headMesh);
+
+const armGeo = new THREE.CylinderGeometry(0.05, 0.035, 1, 8);
+function makeHand(name, color) {
+  const mat = new THREE.MeshLambertMaterial({ color });
+  const mesh = new THREE.Mesh(new THREE.SphereGeometry(CFG.HAND_RADIUS, 20, 14), mat);
+  const arm = new THREE.Mesh(armGeo, lambert(0x2b2b33));
+  scene.add(mesh, arm);
+  return {
+    name, mesh, arm, mat,
+    local: new THREE.Vector3(),   // posición de la mano en el espacio XR (relativa al rig)
+    world: new THREE.Vector3(),   // posición real de la mano en el mundo
+    vis: new THREE.Vector3(),     // posición visual (sin atravesar geometría)
+    prevLocal: new THREE.Vector3(), // posición local de la mano en el frame anterior
+    hasPose: false, hasPrev: false, pressed: false, anchored: false, touching: false, source: null
+  };
+}
+const hands = {
+  left: makeHand('left', 0xff7a1a),
+  right: makeHand('right', 0x2aa8ff)
+};
+const handList = [hands.left, hands.right];
+
+const UP = new THREE.Vector3(0, 1, 0);
+const _a = new THREE.Vector3(), _b = new THREE.Vector3(), _dir = new THREE.Vector3();
+function stretchLimb(mesh, a, b) {
+  _dir.subVectors(b, a);
+  const len = _dir.length() || 1e-4;
+  mesh.position.copy(a).addScaledVector(_dir, 0.5);
+  mesh.scale.set(1, len, 1);
+  mesh.quaternion.setFromUnitVectors(UP, _dir.divideScalar(len));
+}
+
+/* =====================================================================
+ *  HUD DENTRO DE LA RV (plano con canvas, pegado a la cámara)
+ * ===================================================================== */
+const hudCanvas = document.createElement('canvas');
+hudCanvas.width = 768; hudCanvas.height = 256;
+const hudCtx = hudCanvas.getContext('2d');
+const hudTex = new THREE.CanvasTexture(hudCanvas);
+hudTex.colorSpace = THREE.SRGBColorSpace;
+const hudMesh = new THREE.Mesh(
+  new THREE.PlaneGeometry(0.36, 0.12),
+  new THREE.MeshBasicMaterial({ map: hudTex, transparent: true, depthTest: false, fog: false })
+);
+hudMesh.position.set(0, -0.26, -0.75);
+hudMesh.renderOrder = 999;
+camera.add(hudMesh);
+
+function roundRectPath(g, x, y, w, h, r) {
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+function drawHud(speed, fps, inVR) {
+  const g = hudCtx;
+  g.clearRect(0, 0, 768, 256);
+  g.fillStyle = 'rgba(10,14,30,0.72)';
+  roundRectPath(g, 6, 6, 756, 244, 34); g.fill();
+
+  g.textBaseline = 'alphabetic';
+  g.fillStyle = '#ffffff';
+  g.font = 'bold 74px ui-sans-serif, system-ui, sans-serif';
+  g.fillText(speed.toFixed(1) + ' m/s', 34, 96);
+  g.font = '34px ui-sans-serif, system-ui, sans-serif';
+  g.fillStyle = '#9fb3d9';
+  g.fillText('VELOCIDAD  ·  ' + (speed * 3.6).toFixed(0) + ' km/h', 34, 138);
+
+  const physOK = fps > 55;
+  g.fillStyle = physOK ? '#7CFC8A' : '#ffb74d';
+  g.fillText('● FÍSICAS ' + (physOK ? 'OK' : 'LENTAS') + '  ' + Math.round(fps) + ' FPS', 34, 188);
+
+  const L = hands.left, R = hands.right;
+  g.fillStyle = inVR ? '#7CFC8A' : '#9fb3d9';
+  g.fillText((inVR ? '● VR CONECTADO' : '○ VISTA PREVIA'), 34, 232);
+
+  // Diagnóstico por mano: M = mando detectado, T = toca superficie, E = empujando
+  const drawFlags = (label, h, x, y) => {
+    g.font = 'bold 30px ui-sans-serif, system-ui, sans-serif';
+    g.fillStyle = '#ffffff';
+    g.fillText(label, x, y);
+    const items = [['M', h.hasPose], ['T', h.touching], ['E', h.anchored]];
+    items.forEach(([c, on], i) => {
+      g.fillStyle = on ? '#7CFC8A' : '#555b6e';
+      g.fillText(c, x + 40 + i * 34, y);
+    });
+  };
+  drawFlags('I', L, 520, 188);
+  drawFlags('D', R, 520, 232);
+  g.font = '22px ui-sans-serif, system-ui, sans-serif';
+  g.fillStyle = '#9fb3d9';
+  g.fillText('M mando · T toca', 500, 50);
+  g.fillText('E empujando', 500, 80);
+  hudTex.needsUpdate = true;
+}
+
+/* =====================================================================
+ *  ENTRADA XR: poses y botones desde session.inputSources
+ * ===================================================================== */
+const headLocal = new THREE.Vector3(0, 1.6, 0);
+let headValid = false;
+
+function updateXRInputs(frame) {
+  const session = renderer.xr.getSession();
+  const refSpace = renderer.xr.getReferenceSpace();
+  if (!session || !refSpace) return;
+
+  // Pose de la cabeza
+  const vp = frame.getViewerPose(refSpace);
+  if (vp) {
+    const p = vp.transform.position;
+    headLocal.set(p.x, p.y, p.z);
+    headValid = true;
+  }
+
+  // Estado por defecto: sin controlador
+  for (const h of handList) { h.hasPose = false; h.pressed = false; h.source = null; }
+
+  // Controladores izquierdo y derecho (inputSources)
+  for (const src of session.inputSources) {
+    const h = hands[src.handedness];
+    if (!h || !src.gripSpace) continue;
+    h.source = src;
+    const pose = frame.getPose(src.gripSpace, refSpace);
+    if (pose) {
+      const p = pose.transform.position;
+      h.local.set(p.x, p.y, p.z);
+      h.hasPose = true;
+    }
+    const gp = src.gamepad;
+    if (gp && gp.buttons) {
+      const trig = gp.buttons[0], grip = gp.buttons[1];
+      h.pressed = !!((trig && (trig.pressed || trig.value > 0.5)) ||
+                     (grip && (grip.pressed || grip.value > 0.5)));
+    }
+  }
+}
+
+// BRAZOS LARGOS: la mano virtual se aleja del hombro ARM_SCALE veces lo que se aleja la real
+const _sh = new THREE.Vector3();
+function applyLongArms() {
+  for (const h of handList) {
+    if (!h.hasPose) continue;
+    const side = h === hands.left ? -1 : 1;
+    _sh.set(headLocal.x + side * 0.2, headLocal.y - 0.25, headLocal.z);
+    h.local.sub(_sh).multiplyScalar(CFG.ARM_SCALE).add(_sh);
+  }
+}
+
+// Poses simuladas para la vista previa de escritorio
+let demoTimer = 6.5;
+function desktopPose(t, dt) {
+  headLocal.set(0, 1.6, 0);
+  headValid = true;
+  const s = Math.sin(t * 0.002);
+  hands.left.local.set(-0.33, 0.85 + 0.05 * s, -0.15);
+  hands.right.local.set(0.33, 0.85 - 0.05 * s, -0.15);
+  for (const h of handList) { h.hasPose = true; h.pressed = false; h.source = null; }
+  // Demo: el cuerpo cae y rebota de vez en cuando para mostrar las físicas
+  demoTimer += dt;
+  if (demoTimer > 7) {
+    demoTimer = 0;
+    respawn((Math.random() - 0.5) * 10, 8, (Math.random() - 0.5) * 10);
+  }
+}
+
+function pulseHaptic(h, strength = 0.5, ms = 40) {
+  try {
+    const act = h.source && h.source.gamepad && h.source.gamepad.hapticActuators &&
+                h.source.gamepad.hapticActuators[0];
+    if (act && act.pulse) act.pulse(strength, ms);
+  } catch (e) { /* sin háptica */ }
+}
+
+/* =====================================================================
+ *  LOCOMOCIÓN ESTILO GORILLA TAG + SINCRONIZACIÓN CON CANNON
+ * ===================================================================== */
+const headWorld = new THREE.Vector3();
+const bodyStart = new THREE.Vector3();
+const disp = new THREE.Vector3();
+const _e = new THREE.Vector3();
+const _hd = new THREE.Vector3(), _push = new THREE.Vector3(), _tan = new THREE.Vector3(), _n2 = new THREE.Vector3();
+const _vel = new THREE.Vector3();
+let velHist = [];
+let wasAnchored = false;
+let needSpawn = false;
+let physicsOK = true;
+
+function clearAnchors() {
+  for (const h of handList) { h.anchored = false; h.hasPrev = false; }
+  velHist = []; wasAnchored = false;
+}
+function respawn(cx, cy, cz) {
+  // Coloca el rig para que el centro del cuerpo quede en (cx, cy, cz)
+  rig.position.set(cx - headLocal.x, cy + CFG.BODY_DROP - headLocal.y, cz - headLocal.z);
+  playerBody.velocity.set(0, 0, 0);
+  clearAnchors();
+}
+
+function physicsUpdate(dt) {
+  if (needSpawn && headValid) {
+    respawn(CFG.SPAWN.x, CFG.SPAWN.y, CFG.SPAWN.z);
+    needSpawn = false;
+  }
+
+  // 1) Posición mundial de cabeza y de manos (el rig no rota)
+  headWorld.copy(headLocal).add(rig.position);
+  bodyStart.set(headWorld.x, headWorld.y - CFG.BODY_DROP, headWorld.z);
+
+  // 2) Manos (SIN botones). Cada mano es una esfera con volumen:
+  //    - Si empujas la mano CONTRA una superficie, la mano se queda fija en el mundo
+  //      y tu cuerpo se mueve en sentido contrario.
+  //    - Si además la arrastras por la superficie, la fricción también te mueve.
+  //    La velocidad sale del movimiento REAL del brazo: cuanto más rápido empujas, más sales.
+  let anchoredCount = 0;
+  disp.set(0, 0, 0);
+  for (const h of handList) {
+    if (!h.hasPose) { h.touching = false; h.anchored = false; h.hasPrev = false; continue; }
+    h.world.copy(h.local).add(rig.position);
+    if (!h.hasPrev) { h.prevLocal.copy(h.local); h.hasPrev = true; }
+    _hd.subVectors(h.local, h.prevLocal);                   // movimiento real del brazo este frame
+    h.prevLocal.copy(h.local);
+
+    h.vis.copy(h.world);
+    resolveHand(h.vis);
+    const wasTouching = h.touching;
+    h.touching = contact.touch;
+    h.anchored = false;
+    if (h.touching && !wasTouching) pulseHaptic(h, 0.35, 30);
+    if (!h.touching || contact.normal.lengthSq() < 1e-8) continue;
+
+    _n2.copy(contact.normal).normalize();
+    _push.subVectors(h.vis, h.world);                       // cuánto se hundió la mano en la superficie
+    const depth = _push.dot(_n2);
+    const into = _hd.dot(_n2);                              // < 0: la mano avanza hacia la superficie
+    if (depth > 0 && into < -CFG.PUSH_EPS) {
+      const pn = Math.min(-into, depth);                    // solo cuenta lo que realmente se hundió
+      _tan.copy(_hd).addScaledVector(_n2, -into);           // parte paralela a la superficie
+      _e.copy(_n2).multiplyScalar(pn).addScaledVector(_tan, -CFG.HAND_FRICTION);
+      const len = _e.length();
+      if (len > CFG.MAX_PUSH) _e.multiplyScalar(CFG.MAX_PUSH / len);
+      disp.add(_e);
+      anchoredCount++;
+      h.anchored = true;                                    // "empujando"
+    }
+  }
+
+  // 3) Velocidad del cuerpo: gravedad + empuje de las manos (la inercia se conserva al soltar)
+  const v = playerBody.velocity;
+  v.y -= CFG.GRAVITY * dt;                                  // gravedad manual
+  const drag = Math.exp(-CFG.AIR_DRAG * dt);
+  v.x *= drag; v.z *= drag;
+  if (anchoredCount > 0) {
+    disp.multiplyScalar(CFG.LAUNCH_BOOST / (anchoredCount * dt));
+    const sp = disp.length();
+    if (sp > CFG.MAX_SPEED) disp.multiplyScalar(CFG.MAX_SPEED / sp);
+    v.set(disp.x, disp.y, disp.z);                          // mientras empujas, mandan tus manos
+  }
+
+  // 4) Cannon: el cuerpo parte de la posición real de la cabeza (caminar físico incluido)
+  playerBody.position.set(bodyStart.x, bodyStart.y, bodyStart.z);
+  bounceRequest = false;
+  const steps = Math.min(3, Math.max(1, Math.ceil(dt * 90)));
+  const sdt = dt / steps;
+  for (let i = 0; i < steps; i++) world.step(sdt);
+
+  if (bounceRequest) v.y = Math.max(v.y, CFG.BOUNCE_SPEED);   // almohadilla de rebote
+  const maxV = CFG.MAX_SPEED * 1.3;
+  const spd = Math.hypot(v.x, v.y, v.z);
+  if (spd > maxV) { const k = maxV / spd; v.x *= k; v.y *= k; v.z *= k; }
+
+  // 5) Lo que Cannon corrigió (suelo, paredes, rebotes) se aplica al rig
+  rig.position.x += playerBody.position.x - bodyStart.x;
+  rig.position.y += playerBody.position.y - bodyStart.y;
+  rig.position.z += playerBody.position.z - bodyStart.z;
+
+  physicsOK = Number.isFinite(rig.position.x + rig.position.y + rig.position.z);
+  if (!physicsOK || playerBody.position.y < CFG.FALL_LIMIT) {
+    respawn(CFG.SPAWN.x, CFG.SPAWN.y, CFG.SPAWN.z);
+  }
+}
+
+function updateVisuals() {
+  headWorld.copy(headLocal).add(rig.position);
+  const inVR = renderer.xr.isPresenting;
+
+  bodyMesh.position.set(headWorld.x, headWorld.y - CFG.CHEST_OFFSET, headWorld.z);
+  headMesh.position.copy(headWorld);
+  headMesh.visible = !inVR;                                 // no estorbar la vista en VR
+
+  for (const h of handList) {
+    const vis = h.hasPose;
+    h.mesh.visible = h.arm.visible = vis;
+    if (!vis) continue;
+    // Posición visual: la mano no atraviesa paredes ni suelo
+    h.world.copy(h.local).add(rig.position);
+    h.vis.copy(h.world);
+    resolveHand(h.vis);
+    h.mesh.position.copy(h.vis);
+    h.mat.emissive.setHex(h.anchored ? 0x994400 : 0x000000);
+
+    // Brazo: del hombro a la mano
+    const side = h === hands.left ? -1 : 1;
+    _a.set(headWorld.x + side * 0.2, headWorld.y - 0.25, headWorld.z);
+    _b.copy(h.vis);
+    stretchLimb(h.arm, _a, _b);
+  }
+}
+
+/* =====================================================================
+ *  BOTÓN "ENTRAR EN VR" Y CICLO DE VIDA DE LA SESIÓN
+ * ===================================================================== */
+let currentSession = null;
+
+async function setupVRButton() {
+  const btn = ui.vrBtn, msg = ui.vrMsg;
+  if (!window.isSecureContext) {
+    msg.textContent = '⚠ Contexto no seguro: sirve esta página por https o localhost para usar WebXR.';
+  }
+  if (!('xr' in navigator)) {
+    btn.textContent = 'WebXR no disponible';
+    msg.textContent = 'Abre esta página en el navegador de Meta Quest (o un navegador con WebXR).';
+    return;
+  }
+  let ok = false;
+  try { ok = await navigator.xr.isSessionSupported('immersive-vr'); } catch (e) { ok = false; }
+  if (!ok) {
+    // No bloqueamos el botón: algunos navegadores responden "false" y aun así permiten entrar.
+    let inFrame = false;
+    try { inFrame = window.self !== window.top; } catch (e) { inFrame = true; }
+    msg.textContent = 'Aviso: el navegador dice que immersive-vr no está soportado. ' +
+      'Diagnóstico → https/localhost: ' + window.isSecureContext +
+      ' · dentro de iframe: ' + inFrame +
+      ' · navegador: ' + (navigator.userAgent.includes('OculusBrowser') ? 'Meta Quest Browser' : 'otro (' + navigator.userAgent.slice(0, 60) + ')') +
+      '. Pulsa el botón para intentarlo igualmente.';
+  }
+  btn.disabled = false;
+  btn.textContent = '🥽 Entrar en VR';
+
+  btn.onclick = async () => {
+    if (currentSession) { currentSession.end(); return; }
+    try {
+      const session = await navigator.xr.requestSession('immersive-vr', {
+        optionalFeatures: ['local-floor']
+      });
+      currentSession = session;
+      session.addEventListener('end', () => { currentSession = null; });
+      await renderer.xr.setSession(session);
+      renderer.xr.setFoveation(1);
+      // Pide 90 Hz (o 72 Hz) si el visor lo permite
+      if (session.supportedFrameRates && session.updateTargetFrameRate) {
+        const rates = Array.from(session.supportedFrameRates);
+        const target = rates.includes(90) ? 90 : rates.includes(72) ? 72 : Math.max(...rates);
+        try { await session.updateTargetFrameRate(target); } catch (e) { /* ignorar */ }
+      }
+    } catch (err) {
+      msg.textContent = 'No se pudo iniciar la sesión VR: ' + (err && err.message ? err.message : err);
+    }
+  };
+}
+setupVRButton();
+
+renderer.xr.addEventListener('sessionstart', () => {
+  ui.menu.classList.add('hidden');
+  ui.showMenu.classList.add('hidden');
+  ui.dhud.classList.add('hidden');
+  headValid = false;
+  needSpawn = true;                 // reaparece en cuanto haya pose de cabeza
+  clearAnchors();
+});
+renderer.xr.addEventListener('sessionend', () => {
+  ui.menu.classList.remove('hidden');
+  ui.dhud.classList.remove('hidden');
+  ui.vrBtn.textContent = '🥽 Entrar en VR';
+  for (const h of handList) { h.hasPose = false; h.anchored = false; }
+  demoTimer = 6.5;                  // vuelve a lanzar la demo enseguida
+});
+
+/* =====================================================================
+ *  BUCLE PRINCIPAL (setAnimationLoop → 72/90 FPS en Quest)
+ * ===================================================================== */
+let lastTime = null;
+let fpsSmooth = 72;
+let hudTimer = 0;
+
+renderer.setAnimationLoop((time, frame) => {
+  if (lastTime === null) lastTime = time;
+  const dt = Math.min(Math.max((time - lastTime) / 1000, 1 / 240), 1 / 30);
+  lastTime = time;
+  fpsSmooth = fpsSmooth * 0.92 + (1 / dt) * 0.08;
+
+  const inVR = renderer.xr.isPresenting;
+
+  // Entrada: controladores reales en VR, poses simuladas en escritorio
+  if (inVR && frame) updateXRInputs(frame);
+  else if (!inVR) desktopPose(time, dt);
+
+  applyLongArms();
+  physicsUpdate(dt);
+  updateVisuals();
+
+  // HUD (≈8 Hz para no gastar CPU/GPU)
+  hudTimer += dt;
+  if (hudTimer > 0.12) {
+    hudTimer = 0;
+    const speed = Math.hypot(playerBody.velocity.x, playerBody.velocity.y, playerBody.velocity.z);
+    if (inVR) {
+      drawHud(speed, fpsSmooth, true);
+    } else {
+      ui.dhFps.textContent = Math.round(fpsSmooth);
+      ui.dhSpeed.textContent = speed.toFixed(1);
+    }
+  }
+
+  // Cámara: la del rig en VR, órbita alrededor de la arena en escritorio
+  if (inVR) {
+    renderer.render(scene, camera);
+  } else {
+    const a = time * 0.00012;
+    previewCamera.position.set(Math.cos(a) * 20, 16, Math.sin(a) * 20);
+    previewCamera.lookAt(0, 2, 0);
+    renderer.render(scene, previewCamera);
+  }
+});
+</script>
+</body>
+</html>
